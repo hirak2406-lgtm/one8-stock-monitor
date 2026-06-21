@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-Stock monitor for one8.com — Shopify variant availability watcher.
+Stock monitor for one8.com — Shopify availability watcher.
 
-Watches a single Shopify product variant (default: "Seam XVIII Signature - White",
-UK 8) and sends a Telegram push the moment it transitions from sold-out to in-stock.
+Watches the **Seam XVIII Signature (men's)** sneaker across BOTH colourways and ALL
+sizes, and sends a clean Telegram push the moment any variant comes back in stock.
 
 Design goals: NEVER miss a restock, NEVER send a false alert.
-  - Source of truth = Shopify's own `available` flag from the product `.js` endpoint.
-  - Match by variant ID (stable across handle/URL/ordering changes).
-  - Any error (network / non-200 / bad JSON / missing variant) => log + exit, no alert.
-  - Cache-buster + double-confirm second fetch => no stale-CDN false positives.
-  - Edge-trigger off a durable state.json => one alert per restock, lose-state re-alerts.
+  - Source of truth = Shopify's own `available` flag from each product `.js` endpoint.
+  - Track every variant by ID (stable across handle/URL/ordering changes).
+  - Any error (network / non-200 / bad JSON / missing product) => carry prior state,
+    no alert. An error must never look like "in stock" or "out of stock".
+  - Cache-buster + a confirming second fetch => no stale-CDN false positives.
+  - Edge-triggered off a durable state.json => one alert per restock, lose-state re-alerts.
 
 Configuration (env vars override defaults):
-  PRODUCT_HANDLE       Shopify product handle (default: seam-xviii-signature-mens-white)
-  VARIANT_ID           Variant ID to watch    (default: 57738053648544  -> UK 8)
-  STORE_DOMAIN         Store domain           (default: one8.com)
-  STATE_FILE           Path to state file     (default: ./state.json)
-  TELEGRAM_BOT_TOKEN   Telegram bot token     (required to actually send)
-  TELEGRAM_CHAT_ID     Telegram chat id       (required to actually send)
+  PRODUCT_HANDLES   Comma-separated Shopify handles to watch
+                    (default: the white + red Signature colourways)
+  STORE_DOMAIN      Store domain (default: one8.com)
+  STATE_FILE        Path to state file (default: ./state.json)
+  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID   Telegram credentials (required to send)
 
 Flags:
-  --once    Run a single check (default; the cron calls it this way).
   --test    Send a test Telegram message and exit (verifies your credentials).
 """
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -36,9 +36,20 @@ from datetime import datetime, timezone
 # ----------------------------- configuration --------------------------------
 
 STORE_DOMAIN = os.environ.get("STORE_DOMAIN", "one8.com")
-PRODUCT_HANDLE = os.environ.get("PRODUCT_HANDLE", "seam-xviii-signature-mens-white")
-VARIANT_ID = int(os.environ.get("VARIANT_ID", "57738053648544"))  # UK 8
-STATE_FILE = os.environ.get("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
+
+# Both colourways of the men's Seam XVIII Signature. All sizes within each are watched.
+DEFAULT_HANDLES = [
+    "seam-xviii-signature-mens-white",   # Classic White - Green Dew
+    "seam-xviii-signature-mens-red",     # Test Red - Pitch Brown
+]
+PRODUCT_HANDLES = [
+    h.strip() for h in os.environ.get("PRODUCT_HANDLES", ",".join(DEFAULT_HANDLES)).split(",")
+    if h.strip()
+]
+
+STATE_FILE = os.environ.get(
+    "STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -48,7 +59,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 HTTP_TIMEOUT = 15        # seconds per request
-MAX_RETRIES = 3          # network retries before giving up this cycle
+MAX_RETRIES = 3          # network retries before giving up on a product this cycle
 RETRY_BACKOFF = 3        # seconds, multiplied by attempt number
 
 
@@ -59,18 +70,10 @@ def log(msg):
 
 # ------------------------------ networking ----------------------------------
 
-def product_js_url():
-    # Cache-buster defeats Shopify CDN staleness so we always read fresh stock.
+def fetch_product(handle):
+    """Fetch + parse one product's JSON. Returns dict, or None on any failure."""
     cache_buster = int(time.time() * 1000)
-    return (
-        f"https://{STORE_DOMAIN}/products/{PRODUCT_HANDLE}.js"
-        f"?_={cache_buster}"
-    )
-
-
-def fetch_product():
-    """Fetch + parse the product JSON. Returns dict, or None on any failure."""
-    url = product_js_url()
+    url = f"https://{STORE_DOMAIN}/products/{handle}.js?_={cache_buster}"
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -87,65 +90,72 @@ def fetch_product():
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
-                raw = resp.read().decode("utf-8")
-            return json.loads(raw)
+                return json.loads(resp.read().decode("utf-8"))
         except Exception as e:  # noqa: BLE001 - any failure must be non-fatal
             last_err = e
-            log(f"fetch attempt {attempt}/{MAX_RETRIES} failed: {e!r}")
+            log(f"[{handle}] fetch attempt {attempt}/{MAX_RETRIES} failed: {e!r}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF * attempt)
-    log(f"giving up this cycle (last error: {last_err!r}) — NO alert sent")
+    log(f"[{handle}] giving up this cycle (last error: {last_err!r}) — prior state kept")
     return None
 
 
-def find_variant(product):
-    """Return the watched variant dict, or None if not present."""
-    if not product or "variants" not in product:
-        return None
-    for v in product["variants"]:
-        if v.get("id") == VARIANT_ID:
-            return v
-    return None
-
-
-def check_available():
+def scan_products():
     """
-    Returns (available: bool, variant: dict, product: dict) on a clean read,
-    or (None, None, None) if anything went wrong (=> caller must NOT alert).
+    Fetch all watched products. Returns dict:
+      { variant_id: {"available": bool, "handle", "product_title",
+                     "colour", "size", "price"} }
+    Products that fail to fetch are simply absent (caller carries prior state).
     """
-    product = fetch_product()
-    if product is None:
-        return None, None, None
-    variant = find_variant(product)
-    if variant is None:
-        log(f"variant {VARIANT_ID} not found in product JSON — NO alert sent")
-        return None, None, None
-    return bool(variant.get("available")), variant, product
+    seen = {}
+    for handle in PRODUCT_HANDLES:
+        product = fetch_product(handle)
+        if not product or "variants" not in product:
+            continue
+        for v in product["variants"]:
+            vid = v.get("id")
+            if vid is None:
+                continue
+            seen[vid] = {
+                "available": bool(v.get("available")),
+                "handle": handle,
+                "product_title": product.get("title", handle),
+                "colour": v.get("option1") or "",
+                "size": v.get("option2") or v.get("title", ""),
+                "price": v.get("price"),
+            }
+    return seen
 
 
 # -------------------------------- state -------------------------------------
 
-def load_state():
+def load_prior():
+    """Return {variant_id(int): available(bool)} from the state file (empty if none)."""
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
-        # No prior state. Default available=False so a *current* in-stock read
-        # still fires an alert (errs toward notifying, never toward silence).
-        return {"available": False, "last_checked": None}
+        return {}
     except Exception as e:  # noqa: BLE001
-        log(f"state read failed ({e!r}); treating prior state as unknown/False")
-        return {"available": False, "last_checked": None}
+        log(f"state read failed ({e!r}); treating all prior states as unknown/False")
+        return {}
+    variants = data.get("variants", {})
+    out = {}
+    for k, val in variants.items():
+        try:
+            out[int(k)] = bool(val)
+        except (ValueError, TypeError):
+            continue
+    return out
 
 
-def save_state(available):
-    state = {
-        "available": bool(available),
+def write_state(state_map):
+    payload = {
+        "variants": {str(k): bool(v) for k, v in sorted(state_map.items())},
         "last_checked": datetime.now(timezone.utc).isoformat(),
     }
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-    log(f"state saved: available={available}")
+        json.dump(payload, f, indent=2)
 
 
 # ----------------------------- notifications --------------------------------
@@ -159,7 +169,7 @@ def telegram_send(text):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": "false",
+        "disable_web_page_preview": "true",
     }).encode("utf-8")
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -178,71 +188,99 @@ def telegram_send(text):
     return False
 
 
-def price_str(variant):
-    # Shopify .js prices are in minor units (paise). Format as rupees.
+def _size_key(size):
+    m = re.search(r"\d+", size or "")
+    return int(m.group()) if m else 999
+
+
+def price_str(price_minor):
     try:
-        return f"₹{variant['price'] / 100:,.0f}"
+        return f"₹{price_minor / 100:,.0f}"
     except Exception:  # noqa: BLE001
         return "price n/a"
 
 
-def restock_message(variant, product):
-    product_url = f"https://{STORE_DOMAIN}/products/{PRODUCT_HANDLE}?variant={VARIANT_ID}"
-    cart_url = f"https://{STORE_DOMAIN}/cart/{VARIANT_ID}:1"
-    size = variant.get("title", "").split("/")[-1].strip() or "selected size"
-    name = product.get("title", PRODUCT_HANDLE)
-    return (
-        f"🟢 <b>BACK IN STOCK</b>\n\n"
-        f"<b>{name}</b>\n"
-        f"Size: <b>{size}</b>\n"
-        f"Price: {price_str(variant)}\n\n"
-        f"🛒 <a href=\"{cart_url}\">Add to cart now</a>\n"
-        f"🔗 <a href=\"{product_url}\">Product page</a>\n\n"
-        f"<i>Detected {datetime.now(timezone.utc).strftime('%H:%M:%SZ')} — go fast.</i>"
-    )
+def build_message(restocked):
+    """
+    restocked: list of variant-info dicts (the `seen` values) that are newly available.
+    Produces ONE clean message, grouped by product/colour. Product link only (no cart).
+    """
+    # Group by handle.
+    groups = {}
+    for info in restocked:
+        groups.setdefault(info["handle"], []).append(info)
+
+    lines = ["🟢 <b>BACK IN STOCK</b> · one8.com", ""]
+    for handle, items in groups.items():
+        title = items[0]["product_title"]
+        colour = items[0]["colour"]
+        price = price_str(items[0]["price"])
+        sizes = sorted({i["size"] for i in items}, key=_size_key)
+        url = f"https://{STORE_DOMAIN}/products/{handle}"
+        lines.append(f"👟 <b>{title}</b>")
+        if colour:
+            lines.append(f"Colour: {colour}")
+        lines.append(f"Sizes available: <b>{', '.join(sizes)}</b>")
+        lines.append(f"Price: {price}")
+        lines.append(f'🔗 <a href="{url}">View product</a>')
+        lines.append("")
+
+    lines.append(f"<i>Detected {datetime.now(timezone.utc).strftime('%H:%M UTC, %d %b')}</i>")
+    return "\n".join(lines).strip()
 
 
 # -------------------------------- main --------------------------------------
 
 def run_once():
-    available, variant, product = check_available()
+    prior = load_prior()
+    seen = scan_products()
 
-    if available is None:
-        # Error already logged. Do not touch state, do not alert.
+    if not seen:
+        log("no products could be read this cycle — prior state kept, NO alert")
         return 0
 
-    prev = load_state().get("available", False)
-    log(f"variant {VARIANT_ID}: available={available} (previous={prev})")
+    # Detect rising edges: variant went (prior False / unknown) -> now True.
+    rising_ids = [vid for vid, info in seen.items()
+                  if info["available"] and not prior.get(vid, False)]
 
-    if available and not prev:
-        # Rising edge. DOUBLE-CONFIRM before alerting to kill CDN/cache blips.
-        log("rising edge detected — re-fetching to confirm…")
+    total = len(seen)
+    avail_now = sum(1 for i in seen.values() if i["available"])
+    log(f"scanned {total} variants across {len(PRODUCT_HANDLES)} colourways "
+        f"— {avail_now} available, {len(rising_ids)} newly in stock")
+
+    if rising_ids:
+        log("rising edge(s) detected — re-fetching to confirm…")
         time.sleep(2)
-        confirm, c_variant, c_product = check_available()
-        if confirm is True:
-            log("confirmed in stock — sending alert")
-            telegram_send(restock_message(c_variant or variant, c_product or product))
-            save_state(True)
+        confirm = scan_products()
+        confirmed = [seen[vid] for vid in rising_ids
+                     if confirm.get(vid, {}).get("available")]
+        if confirmed:
+            for info in confirmed:
+                log(f"CONFIRMED in stock: {info['product_title']} / {info['colour']} / {info['size']}")
+            telegram_send(build_message(confirmed))
         else:
             log("confirmation failed/disagreed — treating as a blip, NO alert")
-            # Do not persist True; next cycle re-evaluates cleanly.
-        return 0
 
-    if (not available) and prev:
-        log("went out of stock again")
-        save_state(False)
-        return 0
+    # Build the new state. Start from prior (so products that failed to load keep their
+    # last-known value — never falsely flipped to out-of-stock), then apply what we saw.
+    new_state = dict(prior)
+    for vid, info in seen.items():
+        new_state[vid] = info["available"]
 
-    # No availability change. Deliberately do NOT rewrite state.json so the cron
-    # only commits on real transitions (no every-5-min commit churn).
-    log("no change — state.json left untouched")
+    # Persist only when something actually changed (avoids 5-min commit churn).
+    if new_state != prior:
+        write_state(new_state)
+        log("state.json updated")
+    else:
+        log("no change — state.json left untouched")
     return 0
 
 
 def run_test():
     log("sending Telegram test message…")
     ok = telegram_send(
-        "✅ <b>one8 stock monitor</b> test message.\n"
+        "✅ <b>one8 stock monitor</b> test.\n"
+        "Watching: Seam XVIII Signature (White + Red), all UK sizes.\n"
         "If you can read this, alerts are wired up correctly."
     )
     return 0 if ok else 1

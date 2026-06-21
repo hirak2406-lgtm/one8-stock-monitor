@@ -30,9 +30,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Override defaults here if you ever switch size/product:
-          # VARIANT_ID: "57738053648544"
-          # PRODUCT_HANDLE: "seam-xviii-signature-mens-white"
+          # Watches both Seam XVIII Signature colourways (all sizes) by default.
+          # Override here to change which products are watched:
+          # PRODUCT_HANDLES: "seam-xviii-signature-mens-white,seam-xviii-signature-mens-red"
         run: python3 monitor.py
 
       - name: Persist state (only if it changed)
