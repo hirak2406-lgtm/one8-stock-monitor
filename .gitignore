@@ -1,0 +1,9 @@
+# Local secrets — never commit these
+.env
+*.env
+
+# Python noise
+__pycache__/
+*.pyc
+.venv/
+venv/

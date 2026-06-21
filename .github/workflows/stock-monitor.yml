@@ -1,0 +1,48 @@
+name: one8 stock monitor
+
+on:
+  schedule:
+    # Every 5 minutes (GitHub Actions cron minimum granularity).
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}        # allow manual runs from the Actions tab
+
+# Allow the job to push the updated state.json back to the repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run stock check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Override defaults here if you ever switch size/product:
+          # VARIANT_ID: "57738053648544"
+          # PRODUCT_HANDLE: "seam-xviii-signature-mens-white"
+        run: python3 monitor.py
+
+      - name: Persist state (only if it changed)
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "stock-monitor-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: update stock state [skip ci]"
+            git push
+          else
+            echo "No state change to commit."
+          fi
