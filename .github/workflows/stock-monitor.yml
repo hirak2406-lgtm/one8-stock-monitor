@@ -46,3 +46,19 @@ jobs:
           else
             echo "No state change to commit."
           fi
+
+      # Backstop: if ANY step above failed (crash, bad deploy, Telegram outage,
+      # push error), ping the phone directly so a breakage can't go unnoticed.
+      - name: Notify on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TEXT="⚠️ one8 stock monitor FAILED
+          A scheduled run errored — stock checking may be paused until it's fixed.
+          Open the logs: ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" >/dev/null || true
