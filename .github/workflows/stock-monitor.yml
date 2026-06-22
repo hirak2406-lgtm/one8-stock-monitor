@@ -2,10 +2,10 @@ name: one8 stock monitor
 
 on:
   schedule:
-    # Every 30 minutes. Chosen to stay within GitHub's free 2,000 Action-min/month for
-    # private repos (~1,440 min/month, with margin). To go faster (e.g. every 5 min),
-    # make the repo public — Actions is then unlimited & free.
-    - cron: "*/30 * * * *"
+    # Every 5 minutes. Free because this repo is PUBLIC (GitHub Actions minutes are
+    # unlimited for public repos). If you ever make it private again, slow this to
+    # */30 to stay within the 2,000 free private-repo minutes/month.
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}        # allow manual runs from the Actions tab
 
 # Allow the job to push the updated state.json back to the repo.
@@ -32,6 +32,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}   # chat-bot watchdog target (kept out of code)
           # Watches both Seam XVIII Signature colourways (all sizes) by default.
           # Override here to change which products are watched:
           # PRODUCT_HANDLES: "seam-xviii-signature-mens-white,seam-xviii-signature-mens-red"

@@ -67,9 +67,9 @@ RETRY_BACKOFF = 3
 
 # Minutes between cron runs (keep in sync with stock-monitor.yml). Used only for the
 # human-readable "~N min" text in the degraded warning.
-POLL_INTERVAL_MIN = int(os.environ.get("POLL_INTERVAL_MIN", "30"))
-# Consecutive failed-to-read cycles before warning. 2 cycles ≈ ~1 hour at a 30-min cadence.
-DEGRADE_THRESHOLD = int(os.environ.get("DEGRADE_THRESHOLD", "2"))
+POLL_INTERVAL_MIN = int(os.environ.get("POLL_INTERVAL_MIN", "5"))
+# Consecutive failed-to-read cycles before warning. 6 cycles ≈ ~30 min at a 5-min cadence.
+DEGRADE_THRESHOLD = int(os.environ.get("DEGRADE_THRESHOLD", "6"))
 
 
 def log(msg):
@@ -150,10 +150,9 @@ def scan_products():
 DEFAULT_STATE = {"variants": {}, "fail_streak": 0, "last_heartbeat_date": None,
                  "webhook_alerted": False}
 
-# The chat bot's Telegram webhook should point here. Empty disables the watchdog.
-CHAT_WEBHOOK_URL = os.environ.get(
-    "CHAT_WEBHOOK_URL", "https://one8-chat-bot.one8-hirak.workers.dev"
-)
+# The chat bot's Telegram webhook URL — provided via env/secret (kept out of the code so the
+# repo can be public). Empty disables the watchdog.
+CHAT_WEBHOOK_URL = os.environ.get("CHAT_WEBHOOK_URL", "").strip()
 
 
 def load_state():
