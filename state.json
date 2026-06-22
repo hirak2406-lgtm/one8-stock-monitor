@@ -16,6 +16,7 @@
     "57738053779616": false
   },
   "fail_streak": 0,
-  "last_heartbeat_date": "2026-06-21",
-  "last_checked": "2026-06-21T23:57:40.906849+00:00"
+  "last_heartbeat_date": "2026-06-22",
+  "webhook_alerted": false,
+  "last_checked": "2026-06-22T18:14:54.018359+00:00"
 }
