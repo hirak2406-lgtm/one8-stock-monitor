@@ -145,7 +145,13 @@ def scan_products():
 
 # -------------------------------- state -------------------------------------
 
-DEFAULT_STATE = {"variants": {}, "fail_streak": 0, "last_heartbeat_date": None}
+DEFAULT_STATE = {"variants": {}, "fail_streak": 0, "last_heartbeat_date": None,
+                 "webhook_alerted": False}
+
+# The chat bot's Telegram webhook should point here. Empty disables the watchdog.
+CHAT_WEBHOOK_URL = os.environ.get(
+    "CHAT_WEBHOOK_URL", "https://one8-chat-bot.one8-hirak.workers.dev"
+)
 
 
 def load_state():
@@ -160,6 +166,7 @@ def load_state():
     out = dict(DEFAULT_STATE)
     out["fail_streak"] = int(data.get("fail_streak", 0) or 0)
     out["last_heartbeat_date"] = data.get("last_heartbeat_date")
+    out["webhook_alerted"] = bool(data.get("webhook_alerted", False))
     variants = {}
     for k, val in (data.get("variants") or {}).items():
         try:
@@ -176,6 +183,7 @@ def state_signature(state):
         tuple(sorted(state["variants"].items())),
         state["fail_streak"],
         state["last_heartbeat_date"],
+        state["webhook_alerted"],
     )
 
 
@@ -184,6 +192,7 @@ def write_state(state):
         "variants": {str(k): bool(v) for k, v in sorted(state["variants"].items())},
         "fail_streak": state["fail_streak"],
         "last_heartbeat_date": state["last_heartbeat_date"],
+        "webhook_alerted": state["webhook_alerted"],
         "last_checked": datetime.now(timezone.utc).isoformat(),
     }
     with open(STATE_FILE, "w") as f:
@@ -276,6 +285,60 @@ def build_heartbeat_message(avail_now, total, degraded_note):
     )
 
 
+# --------------------------- chat-bot watchdog ------------------------------
+# The conversational checker is a Cloudflare Worker webhook. It can't alert about
+# its own death, so this reliable 5-min monitor watches it: each run it asks Telegram
+# whether the webhook is healthy and pings you (once) if it isn't, and again on recovery.
+
+def check_webhook_health(state):
+    if not CHAT_WEBHOOK_URL or not TELEGRAM_BOT_TOKEN:
+        return
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+    try:
+        with urllib.request.urlopen(api, timeout=HTTP_TIMEOUT) as resp:
+            info = json.loads(resp.read().decode("utf-8")).get("result", {})
+    except Exception as e:  # noqa: BLE001 - transient; don't flip state or alert
+        log(f"webhook health check skipped (getWebhookInfo failed: {e!r})")
+        return
+
+    url = info.get("url") or ""
+    pending = info.get("pending_update_count", 0) or 0
+    err_msg = info.get("last_error_message") or ""
+    err_date = info.get("last_error_date") or 0
+    err_age = (time.time() - err_date) if err_date else None
+    recent_err = err_age is not None and err_age < 900  # within 15 min
+
+    # Unhealthy if the webhook was removed/changed, messages are piling up undelivered,
+    # or Telegram is currently failing to reach the Worker with messages waiting.
+    reasons = []
+    if not url:
+        reasons.append("webhook is not set")
+    elif url != CHAT_WEBHOOK_URL:
+        reasons.append(f"webhook points elsewhere ({url})")
+    if pending >= 3:
+        reasons.append(f"{pending} messages stuck undelivered")
+    if recent_err and pending >= 1:
+        reasons.append(f"recent delivery error: {err_msg}")
+
+    unhealthy = bool(reasons)
+    if unhealthy and not state["webhook_alerted"]:
+        log(f"WEBHOOK UNHEALTHY: {reasons}")
+        telegram_send(
+            "⚠️ <b>Chat bot problem</b>\n\n"
+            "Your “check a product” bot may not be answering:\n"
+            + "\n".join(f"• {r}" for r in reasons)
+            + "\n\n<i>Your 24/7 restock monitor is unaffected and still running.</i>"
+        )
+        state["webhook_alerted"] = True
+    elif not unhealthy and state["webhook_alerted"]:
+        log("webhook recovered")
+        telegram_send("✅ <b>Chat bot recovered</b> — it's answering product checks again.")
+        state["webhook_alerted"] = False
+    else:
+        log(f"webhook healthy (pending={pending}, "
+            f"last_error={'none' if not err_msg else f'{int(err_age)}s ago'})")
+
+
 # -------------------------------- main --------------------------------------
 
 def run_once():
@@ -330,6 +393,9 @@ def run_once():
         note = ("⚠️ Note: some pages currently unreadable." if bad_handles else "")
         if telegram_send(build_heartbeat_message(avail_now, len(seen) or expected, note)):
             state["last_heartbeat_date"] = today
+
+    # ---- watchdog: is the conversational chat bot's webhook healthy? ----
+    check_webhook_health(state)
 
     # ---- persist only on a meaningful change ----------------------------
     before = load_state()  # re-read to compare against on-disk signature

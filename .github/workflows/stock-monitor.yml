@@ -2,8 +2,10 @@ name: one8 stock monitor
 
 on:
   schedule:
-    # Every 5 minutes (GitHub Actions cron minimum granularity).
-    - cron: "*/5 * * * *"
+    # Every 30 minutes. Chosen to stay within GitHub's free 2,000 Action-min/month for
+    # private repos (~1,440 min/month, with margin). To go faster (e.g. every 5 min),
+    # make the repo public — Actions is then unlimited & free.
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}        # allow manual runs from the Actions tab
 
 # Allow the job to push the updated state.json back to the repo.
