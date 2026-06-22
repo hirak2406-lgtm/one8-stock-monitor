@@ -1,21 +1,22 @@
-name: one8 stock monitor
+name: one8 chat bot
+
+# Answers "check <product>" messages you send the Telegram bot, searching one8.com.
+# Runs every 5 min, so replies arrive within ~5 minutes (works with your Mac off).
 
 on:
   schedule:
-    # Every 5 minutes (GitHub Actions cron minimum granularity).
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}        # allow manual runs from the Actions tab
+  workflow_dispatch: {}
 
-# Allow the job to push the updated state.json back to the repo.
 permissions:
   contents: write
 
 concurrency:
-  group: stock-monitor
+  group: telegram-bot          # never let two pollers consume updates at once
   cancel-in-progress: false
 
 jobs:
-  check:
+  poll:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,30 +27,25 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run stock check
+      - name: Answer pending messages
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Watches both Seam XVIII Signature colourways (all sizes) by default.
-          # Override here to change which products are watched:
-          # PRODUCT_HANDLES: "seam-xviii-signature-mens-white,seam-xviii-signature-mens-red"
-        run: python3 monitor.py
+        run: python3 bot_poll.py
 
-      - name: Persist state (only if it changed)
+      - name: Persist read-offset (only if it changed)
         run: |
-          if [ -n "$(git status --porcelain state.json)" ]; then
+          if [ -n "$(git status --porcelain telegram_offset.json)" ]; then
             git config user.name "stock-monitor-bot"
             git config user.email "actions@users.noreply.github.com"
-            git add state.json
-            git commit -m "chore: update stock state [skip ci]"
+            git add telegram_offset.json
+            git commit -m "chore: advance telegram offset [skip ci]"
             git pull --rebase --autostash origin main || true
             git push
           else
-            echo "No state change to commit."
+            echo "No offset change to commit."
           fi
 
-      # Backstop: if ANY step above failed (crash, bad deploy, Telegram outage,
-      # push error), ping the phone directly so a breakage can't go unnoticed.
       - name: Notify on failure
         if: failure()
         env:
@@ -57,9 +53,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          TEXT="⚠️ one8 stock monitor FAILED
-          A scheduled run errored — stock checking may be paused until it's fixed.
-          Open the logs: ${RUN_URL}"
+          TEXT="⚠️ one8 chat bot FAILED
+          The message-answering job errored. Stock alerts are unaffected.
+          Logs: ${RUN_URL}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${TEXT}" >/dev/null || true
