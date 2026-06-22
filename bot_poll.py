@@ -50,9 +50,12 @@ def log(msg):
 # ------------------------------ http helpers --------------------------------
 
 def http_json(url, data=None):
+    # localization cookie pins Shopify Markets to India (base INR price); harmless on
+    # the Telegram API calls that also use this helper.
     req = urllib.request.Request(
         url, data=data,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json",
+                 "Cookie": "localization=IN; cart_currency=INR"},
     )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))

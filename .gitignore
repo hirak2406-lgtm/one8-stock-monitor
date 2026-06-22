@@ -7,3 +7,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Node / Cloudflare Worker
+node_modules/
+.wrangler/

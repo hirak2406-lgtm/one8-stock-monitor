@@ -92,6 +92,9 @@ def fetch_product(handle):
                     "Accept-Language": "en-GB,en;q=0.9",
                     "Cache-Control": "no-cache",
                     "Pragma": "no-cache",
+                    # Pin Shopify Markets to India so price is always base INR (this runs
+                    # on GitHub's US servers, which would otherwise localize the currency).
+                    "Cookie": "localization=IN; cart_currency=INR",
                 },
             )
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
