@@ -65,9 +65,11 @@ HTTP_TIMEOUT = 15
 MAX_RETRIES = 3
 RETRY_BACKOFF = 3
 
-# How many consecutive cycles of failing to read a product before we warn.
-# Cron runs every 5 min, so 6 ≈ 30 minutes of sustained trouble.
-DEGRADE_THRESHOLD = 6
+# Minutes between cron runs (keep in sync with stock-monitor.yml). Used only for the
+# human-readable "~N min" text in the degraded warning.
+POLL_INTERVAL_MIN = int(os.environ.get("POLL_INTERVAL_MIN", "30"))
+# Consecutive failed-to-read cycles before warning. 2 cycles ≈ ~1 hour at a 30-min cadence.
+DEGRADE_THRESHOLD = int(os.environ.get("DEGRADE_THRESHOLD", "2"))
 
 
 def log(msg):
@@ -358,7 +360,7 @@ def run_once():
 
     if bad_handles and state["fail_streak"] >= DEGRADE_THRESHOLD \
             and state["fail_streak"] % DEGRADE_THRESHOLD == 0:
-        minutes = state["fail_streak"] * 5
+        minutes = state["fail_streak"] * POLL_INTERVAL_MIN
         log(f"DEGRADED: {bad_handles} unreadable for ~{minutes} min — warning")
         telegram_send(build_degraded_message(bad_handles, minutes))
 
@@ -369,20 +371,29 @@ def run_once():
     log(f"scanned {len(seen)} variants; readable colourways {len(readable)}/{expected}; "
         f"{avail_now} available; {len(rising_ids)} newly in stock; fail_streak={state['fail_streak']}")
 
+    unsent_restock_ids = set()
     if rising_ids:
         log("rising edge(s) detected — re-fetching to confirm…")
         time.sleep(2)
         confirm, _ = scan_products()
-        confirmed = [seen[vid] for vid in rising_ids if confirm.get(vid, {}).get("available")]
-        if confirmed:
-            for info in confirmed:
+        confirmed_ids = [vid for vid in rising_ids if confirm.get(vid, {}).get("available")]
+        if confirmed_ids:
+            for vid in confirmed_ids:
+                info = seen[vid]
                 log(f"CONFIRMED: {info['product_title']} / {info['colour']} / {info['size']}")
-            telegram_send(build_restock_message(confirmed))
+            if not telegram_send(build_restock_message([seen[vid] for vid in confirmed_ids])):
+                # The alert did NOT go out (e.g. Telegram outage). Do not advance these
+                # variants to 'available' — keep them so the rising edge fires again next
+                # cycle. A restock alert must never be dropped on a send failure.
+                unsent_restock_ids = set(confirmed_ids)
+                log("restock alert FAILED to send — state not advanced; will retry next cycle")
         else:
             log("confirmation failed/disagreed — treating as a blip, NO alert")
 
     # ---- update variant state (carry prior for unread handles) ----------
     for vid, info in seen.items():
+        if vid in unsent_restock_ids:
+            continue  # leave prior value so an unsent restock re-alerts next run
         prior_variants[vid] = info["available"]
     state["variants"] = prior_variants
 

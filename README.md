@@ -1,65 +1,71 @@
-# one8.com Stock Monitor 👟
+# one8.com Stock Monitor + Chat Checker 👟
 
-Watches a single Shopify variant on **one8.com** and sends a **Telegram** push the moment
-it comes back in stock. Runs free in the cloud via **GitHub Actions** (every 5 min), so it
-works even when your Mac is off.
+Two cooperating Telegram bots for **one8.com** (a Shopify store):
 
-**Default target:** `Seam XVIII Signature - White`, **UK 8** (variant `57738053648544`).
+1. **24/7 stock monitor** — watches the **Seam XVIII Signature** sneaker across **both
+   colourways** (White = `seam-xviii-signature-mens-white`, Red = `seam-xviii-signature-mens-red`)
+   and **all UK sizes**, and pushes a Telegram alert the moment any of them restocks.
+   Runs on **GitHub Actions** (cloud, works with your Mac off).
+2. **Conversational checker** — message the bot any one8.com product name and it replies
+   with that product's current stock. Runs as a **Cloudflare Worker webhook** (~1–3 s replies).
 
-## Why it's reliable (no missed / no false alerts)
+## Why the monitor is reliable (no missed / no false alerts)
 
-- Reads Shopify's own `available` flag from `…/products/<handle>.js` — the same flag the
-  store's "Add to Cart" button obeys. No HTML scraping.
-- Matches by **variant ID**, so it survives URL / ordering changes.
-- Any error (network, non-200, bad JSON, missing variant) → logs and exits, **never** alerts.
+- Reads Shopify's own `available` flag from `…/products/<handle>.js` — the authoritative
+  signal, not HTML scraping. Matches by **variant ID**, so it survives URL/ordering changes.
+- Any fetch error (network / non-200 / bad JSON) → keeps prior state, **never** alerts.
 - Cache-buster + a **second confirming fetch** before alerting → no stale-CDN false positives.
-- **Edge-triggered** off `state.json` → exactly one alert per restock; if state is ever lost
-  it re-alerts rather than going silent.
+- **Edge-triggered** off `state.json` → one alert per restock. A restock alert is **not**
+  marked done unless the Telegram send actually succeeds (so a send failure re-alerts, never drops).
+- Prices pinned to base **INR** via a `localization=IN` cookie (Shopify Markets otherwise
+  geo-localizes the currency on non-India servers).
+
+## Self-monitoring ("tell me if it breaks")
+
+- **Failure alert:** a workflow step pings you if any monitor run crashes.
+- **Degraded warning:** if a product page is unreadable for a sustained period, you're warned.
+- **Daily heartbeat:** a once-a-day "✅ still watching" message; its commit also keeps the
+  GitHub cron from idle-disabling. If the heartbeat stops, the bot has stopped.
+- **Chat-bot watchdog:** each monitor run checks the chat bot's webhook health and alerts you
+  (and on recovery) if it stops answering.
 
 No third-party Python packages — standard library only.
 
----
+## Files
 
-## Setup
+| File | Role |
+|---|---|
+| `monitor.py` | 24/7 stock monitor + self-monitoring + chat-bot watchdog |
+| `state.json` | Durable state (per-variant availability, fail streak, heartbeat date, webhook flag) |
+| `.github/workflows/stock-monitor.yml` | Cron (every 30 min) + manual run; commits state; failure alert |
+| `worker/worker.js` | Cloudflare Worker — the conversational checker (webhook) |
+| `worker/wrangler.toml`, `worker/package.json` | Worker deploy config |
+| `worker/test.mjs` | Local test: `node worker/test.mjs "pavilion white"` |
+| `get_chat_id.py` | One-time helper to find your Telegram chat ID |
+| `bot_poll.py` | *Legacy* polling version of the chat checker (superseded by the Worker) |
 
-### 1. Create a Telegram bot
-1. In Telegram, message **@BotFather** → `/newbot` → follow prompts → copy the **bot token**.
-2. Open your new bot and send it any message (e.g. `hi`).
-3. Get your chat ID:
-   ```bash
-   TELEGRAM_BOT_TOKEN=<your-token> python3 get_chat_id.py
-   ```
-   Copy the printed `TELEGRAM_CHAT_ID`.
+## Configuration
 
-### 2. Test locally
-```bash
-export TELEGRAM_BOT_TOKEN=<your-token>
-export TELEGRAM_CHAT_ID=<your-chat-id>
+Monitor env (defaults in `stock-monitor.yml`):
+- `PRODUCT_HANDLES` — comma-separated handles to watch (default: the two Signature colourways)
+- `POLL_INTERVAL_MIN` — used for the degraded-warning text; keep in sync with the cron (30)
+- `HEARTBEAT_UTC_HOUR` — hour (UTC) for the daily heartbeat (default 4 ≈ 9:30 IST)
+- `CHAT_WEBHOOK_URL` — the chat Worker URL the watchdog checks
 
-python3 monitor.py --test     # sends a test push — check your phone
-python3 monitor.py            # one real check (will say "not available" right now)
-```
+Secrets are **never committed**: `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` live in GitHub
+Actions secrets (monitor) and Cloudflare Worker secrets (chat bot, plus `WEBHOOK_SECRET`).
 
-### 3. Deploy to GitHub Actions (the cloud part)
-1. Create a **private** GitHub repo and push this folder to it.
-2. In the repo: **Settings → Secrets and variables → Actions → New repository secret**, add:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-3. **Actions** tab → enable workflows → run **one8 stock monitor** once via **Run workflow**
-   to confirm it goes green. After that the cron runs every 5 minutes automatically.
+## Cost (free tier)
 
----
+- **GitHub Actions:** private repo = 2,000 min/month. At every 30 min (~1,440 min/month) it
+  stays free. **Every 5 min would exceed the cap** — to run that fast for free, make the repo
+  **public** (Actions is then unlimited; no secrets are in the code).
+- **Cloudflare Worker + Telegram:** free, tiny usage.
 
-## Changing the watched size / product
+## Common tasks
 
-Edit the env defaults in [`.github/workflows/stock-monitor.yml`](.github/workflows/stock-monitor.yml)
-(or set `VARIANT_ID` / `PRODUCT_HANDLE` locally). To find a variant ID, open
-`https://one8.com/products/<handle>.js` and read the `variants[].id` for the size you want.
-
-## Notes / trade-offs
-
-- GitHub Actions cron is **~5-min** granularity and can lag under load. Fine for a normal
-  "Coming Soon → restock". For sub-minute polling you'd need an always-on machine
-  (e.g. a `launchd` agent) — ask and we can add one.
-- `state.json` is committed by the bot **only when availability flips**, so the repo isn't
-  spammed with commits.
+- **Watch a different product/size:** set `PRODUCT_HANDLES` in `stock-monitor.yml`. Find a
+  handle at `https://one8.com/products.json`.
+- **Redeploy the chat Worker:** `cd worker && CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=… npx wrangler@3 deploy`
+- **Revert chat bot to polling:** `curl .../deleteWebhook` and re-enable a poller.
+- **Test the monitor locally:** `TELEGRAM_BOT_TOKEN=… TELEGRAM_CHAT_ID=… python3 monitor.py --test`
