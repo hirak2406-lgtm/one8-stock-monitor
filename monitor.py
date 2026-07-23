@@ -148,7 +148,7 @@ def scan_products():
 # -------------------------------- state -------------------------------------
 
 DEFAULT_STATE = {"variants": {}, "fail_streak": 0, "last_heartbeat_date": None,
-                 "webhook_alerted": False}
+                 "webhook_alerted": False, "delisted": []}
 
 # The chat bot's Telegram webhook URL — provided via env/secret (kept out of the code so the
 # repo can be public). Empty disables the watchdog.
@@ -168,6 +168,7 @@ def load_state():
     out["fail_streak"] = int(data.get("fail_streak", 0) or 0)
     out["last_heartbeat_date"] = data.get("last_heartbeat_date")
     out["webhook_alerted"] = bool(data.get("webhook_alerted", False))
+    out["delisted"] = list(data.get("delisted", []) or [])
     variants = {}
     for k, val in (data.get("variants") or {}).items():
         try:
@@ -185,6 +186,7 @@ def state_signature(state):
         state["fail_streak"],
         state["last_heartbeat_date"],
         state["webhook_alerted"],
+        tuple(sorted(state.get("delisted", []))),
     )
 
 
@@ -194,6 +196,7 @@ def write_state(state):
         "fail_streak": state["fail_streak"],
         "last_heartbeat_date": state["last_heartbeat_date"],
         "webhook_alerted": state["webhook_alerted"],
+        "delisted": sorted(state.get("delisted", [])),
         "last_checked": datetime.now(timezone.utc).isoformat(),
     }
     with open(STATE_FILE, "w") as f:
@@ -240,6 +243,39 @@ def price_str(price_minor):
         return f"₹{price_minor / 100:,.0f}"
     except Exception:  # noqa: BLE001
         return "price n/a"
+
+
+def pretty_handle(handle):
+    """seam-xviii-signature-mens-white -> 'Seam XVIII Signature — White (mens)'."""
+    words = handle.replace("-", " ").split()
+    fixed = []
+    for w in words:
+        if w == "xviii":
+            fixed.append("XVIII")
+        elif w in ("mens", "womens"):
+            fixed.append(f"({w})")
+        else:
+            fixed.append(w.capitalize())
+    return " ".join(fixed)
+
+
+def build_delisted_message(handles):
+    items = "\n".join(f"• {pretty_handle(h)}" for h in handles)
+    return (
+        "ℹ️ <b>Removed from one8.com</b>\n\n"
+        f"{items}\n\n"
+        "This product page was pulled from the site (often done before a restock). "
+        "I'll keep watching and ping you the moment it's back — no action needed."
+    )
+
+
+def build_relisted_message(handles):
+    lines = ["🔵 <b>BACK ON THE SITE</b>\n"]
+    for h in handles:
+        lines.append(f"👟 <b>{pretty_handle(h)}</b>")
+        lines.append(f'🔗 <a href="https://{STORE_DOMAIN}/products/{h}">View product</a>')
+    lines.append("\nNow watching its sizes again — you'll get a stock alert if any size is buyable.")
+    return "\n".join(lines)
 
 
 def build_restock_message(restocked):
@@ -349,19 +385,43 @@ def run_once():
     seen, statuses = scan_products()
     expected = len(PRODUCT_HANDLES)
     readable = [h for h, s in statuses.items() if s == "ok"]
-    bad_handles = [h for h, s in statuses.items() if s != "ok"]
+    notfound_handles = [h for h, s in statuses.items() if s == "notfound"]
+    errored_handles = [h for h, s in statuses.items() if s == "error"]
 
-    # ---- health / degraded tracking -------------------------------------
-    if len(readable) == expected:
+    # ---- delisted / relisted tracking (a clean 404 = product pulled) -----
+    # A definitive 404 means the product was removed from the site (often before a
+    # restock). That is NOT the same as a transient "can't read" error, so we track it
+    # separately: notify once on delist, notify on relist, and don't spam the degraded
+    # warning for it.
+    prior_delisted = set(state.get("delisted", []))
+    new_delisted = set()
+    for h, s in statuses.items():
+        if s == "notfound":
+            new_delisted.add(h)
+        elif s == "error" and h in prior_delisted:
+            new_delisted.add(h)  # couldn't confirm either way this cycle — keep prior
+    just_delisted = sorted(new_delisted - prior_delisted)
+    just_relisted = sorted(h for h in prior_delisted if statuses.get(h) == "ok")
+    if just_delisted:
+        log(f"DELISTED (404, product pulled): {just_delisted}")
+        telegram_send(build_delisted_message(just_delisted))
+    if just_relisted:
+        log(f"RELISTED (back on site): {just_relisted}")
+        telegram_send(build_relisted_message(just_relisted))
+    state["delisted"] = sorted(new_delisted)
+
+    # ---- health / degraded tracking (only TRANSIENT read errors) --------
+    # Clean 404s are handled above as delisted, not counted as "can't read".
+    if not errored_handles:
         state["fail_streak"] = 0
     else:
         state["fail_streak"] += 1
 
-    if bad_handles and state["fail_streak"] >= DEGRADE_THRESHOLD \
+    if errored_handles and state["fail_streak"] >= DEGRADE_THRESHOLD \
             and state["fail_streak"] % DEGRADE_THRESHOLD == 0:
         minutes = state["fail_streak"] * POLL_INTERVAL_MIN
-        log(f"DEGRADED: {bad_handles} unreadable for ~{minutes} min — warning")
-        telegram_send(build_degraded_message(bad_handles, minutes))
+        log(f"DEGRADED: {errored_handles} unreadable for ~{minutes} min — warning")
+        telegram_send(build_degraded_message(errored_handles, minutes))
 
     # ---- stock detection (only over variants we actually read) ----------
     rising_ids = [vid for vid, info in seen.items()
@@ -400,7 +460,12 @@ def run_once():
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
     if state["last_heartbeat_date"] != today and now.hour >= HEARTBEAT_UTC_HOUR:
-        note = ("⚠️ Note: some pages currently unreadable." if bad_handles else "")
+        if errored_handles:
+            note = "⚠️ Note: some pages currently unreadable."
+        elif state["delisted"]:
+            note = f"ℹ️ Note: {len(state['delisted'])} product(s) currently removed from the site."
+        else:
+            note = ""
         if telegram_send(build_heartbeat_message(avail_now, len(seen) or expected, note)):
             state["last_heartbeat_date"] = today
 
