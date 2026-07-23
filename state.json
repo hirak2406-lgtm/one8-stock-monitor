@@ -15,8 +15,11 @@
     "57738053746848": false,
     "57738053779616": false
   },
-  "fail_streak": 28,
+  "fail_streak": 0,
   "last_heartbeat_date": "2026-07-23",
   "webhook_alerted": false,
-  "last_checked": "2026-07-23T12:57:56.283274+00:00"
+  "delisted": [
+    "seam-xviii-signature-mens-white"
+  ],
+  "last_checked": "2026-07-23T13:32:14.492443+00:00"
 }
