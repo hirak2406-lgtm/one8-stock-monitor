@@ -16,11 +16,8 @@
     "57738053779616": false
   },
   "fail_streak": 0,
-  "last_heartbeat_date": "2026-08-09",
+  "last_heartbeat_date": "2026-08-10",
   "webhook_alerted": false,
-  "delisted": [
-    "seam-xviii-signature-mens-red",
-    "seam-xviii-signature-mens-white"
-  ],
-  "last_checked": "2026-08-09T04:40:28.958790+00:00"
+  "delisted": [],
+  "last_checked": "2026-08-10T04:22:29.911845+00:00"
 }
