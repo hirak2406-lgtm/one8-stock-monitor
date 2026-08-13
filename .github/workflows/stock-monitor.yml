@@ -33,6 +33,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}   # chat-bot watchdog target (kept out of code)
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}       # loud wake-you-up restock alert
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
           # Watches both Seam XVIII Signature colourways (all sizes) by default.
           # Override here to change which products are watched:
           # PRODUCT_HANDLES: "seam-xviii-signature-mens-white,seam-xviii-signature-mens-red"

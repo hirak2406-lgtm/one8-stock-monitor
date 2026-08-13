@@ -57,6 +57,13 @@ HEARTBEAT_UTC_HOUR = int(os.environ.get("HEARTBEAT_UTC_HOUR", "4"))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+# Pushover = the loud, repeat-until-acknowledged "wake me up" alert. Optional: if these are
+# unset the monitor still works (Telegram only). Only the real RESTOCK alert uses Pushover.
+PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "").strip()
+PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "").strip()
+# Variant the buyer cares most about (UK 8 White) — its buy link is featured in the alert.
+PRIORITY_VARIANT_ID = int(os.environ.get("PRIORITY_VARIANT_ID", "57738053648544"))
+
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -135,6 +142,7 @@ def scan_products():
                 if vid is None:
                     continue
                 seen[vid] = {
+                    "variant_id": vid,
                     "available": bool(v.get("available")),
                     "handle": handle,
                     "product_title": data.get("title", handle),
@@ -233,6 +241,44 @@ def telegram_send(text):
     return False
 
 
+def pushover_send(title, message, url="", url_title="Buy now"):
+    """Loud EMERGENCY push: repeats every 30s for up to 1h until acknowledged, and can
+    override silent/Do-Not-Disturb (enable Critical Alerts in the Pushover app). Used only
+    for the real restock alert. No-op (returns False) if Pushover isn't configured."""
+    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
+        log("Pushover not configured — skipping loud alert (Telegram still sent)")
+        return False
+    params = {
+        "token": PUSHOVER_TOKEN,
+        "user": PUSHOVER_USER,
+        "title": title,
+        "message": message,
+        "priority": 2,      # emergency
+        "retry": 30,        # re-alert every 30s…
+        "expire": 3600,     # …for up to 1 hour, until you acknowledge
+        "sound": "persistent",
+    }
+    if url:
+        params["url"] = url
+        params["url_title"] = url_title
+    data = urllib.parse.urlencode(params).encode("utf-8")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            if body.get("status") == 1:
+                log("Pushover EMERGENCY alert sent")
+                return True
+            raise RuntimeError(body)
+        except Exception as e:  # noqa: BLE001
+            log(f"pushover attempt {attempt}/{MAX_RETRIES} failed: {e!r}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF * attempt)
+    log("Pushover send FAILED after retries")
+    return False
+
+
 def _size_key(size):
     m = re.search(r"\d+", size or "")
     return int(m.group()) if m else 999
@@ -278,6 +324,11 @@ def build_relisted_message(handles):
     return "\n".join(lines)
 
 
+def cart_url(variant_id):
+    # Shopify permalink: adds 1 of this variant to the cart and goes straight to checkout.
+    return f"https://{STORE_DOMAIN}/cart/{variant_id}:1"
+
+
 def build_restock_message(restocked):
     groups = {}
     for info in restocked:
@@ -288,17 +339,37 @@ def build_restock_message(restocked):
         title = items[0]["product_title"]
         colour = items[0]["colour"]
         price = price_str(items[0]["price"])
-        sizes = sorted({i["size"] for i in items}, key=_size_key)
-        url = f"https://{STORE_DOMAIN}/products/{handle}"
+        items_sorted = sorted(items, key=lambda i: _size_key(i["size"]))
+        # One-tap buy link per available size (Shopify cart permalink → checkout).
+        buy = " · ".join(
+            f'<a href="{cart_url(i["variant_id"])}">{i["size"]}</a>' for i in items_sorted
+        )
+        product_url = f"https://{STORE_DOMAIN}/products/{handle}"
         lines.append(f"👟 <b>{title}</b>")
         if colour:
             lines.append(f"Colour: {colour}")
-        lines.append(f"Sizes available: <b>{', '.join(sizes)}</b>")
         lines.append(f"Price: {price}")
-        lines.append(f'🔗 <a href="{url}">View product</a>')
+        lines.append(f"🛒 <b>Buy now</b> (tap your size): {buy}")
+        lines.append(f'🔗 <a href="{product_url}">Product page</a>')
         lines.append("")
     lines.append(f"<i>Detected {datetime.now(timezone.utc).strftime('%H:%M UTC, %d %b')}</i>")
     return "\n".join(lines).strip()
+
+
+def build_restock_pushover(restocked):
+    """Returns (title, message, url, url_title) for the loud emergency push. The featured
+    buy link points to the priority variant (UK 8 White) when it's in the batch."""
+    by_handle = {}
+    for info in restocked:
+        by_handle.setdefault(info["handle"], []).append(info)
+    parts = []
+    for items in by_handle.values():
+        sizes = sorted({i["size"] for i in items}, key=_size_key)
+        parts.append(f"{items[0]['product_title']}: {', '.join(sizes)}")
+    primary = next((i for i in restocked if i["variant_id"] == PRIORITY_VARIANT_ID), restocked[0])
+    title = "🟢 BACK IN STOCK — one8"
+    message = " | ".join(parts) + " — tap to buy fast (checkout in seconds)"
+    return title, message, cart_url(primary["variant_id"]), f"Buy {primary['size']} now"
 
 
 def build_degraded_message(bad_handles, minutes):
@@ -437,15 +508,19 @@ def run_once():
         confirm, _ = scan_products()
         confirmed_ids = [vid for vid in rising_ids if confirm.get(vid, {}).get("available")]
         if confirmed_ids:
-            for vid in confirmed_ids:
-                info = seen[vid]
+            confirmed = [seen[vid] for vid in confirmed_ids]
+            for info in confirmed:
                 log(f"CONFIRMED: {info['product_title']} / {info['colour']} / {info['size']}")
-            if not telegram_send(build_restock_message([seen[vid] for vid in confirmed_ids])):
-                # The alert did NOT go out (e.g. Telegram outage). Do not advance these
-                # variants to 'available' — keep them so the rising edge fires again next
-                # cycle. A restock alert must never be dropped on a send failure.
+            # Two channels: Telegram (with per-size buy links) + Pushover (loud, wakes you).
+            tg_ok = telegram_send(build_restock_message(confirmed))
+            po_title, po_msg, po_url, po_url_title = build_restock_pushover(confirmed)
+            po_ok = pushover_send(po_title, po_msg, po_url, po_url_title)
+            if not (tg_ok or po_ok):
+                # Neither channel delivered (e.g. outage). Do not advance these variants to
+                # 'available' — keep them so the rising edge fires again next cycle. A restock
+                # alert must never be dropped on a send failure.
                 unsent_restock_ids = set(confirmed_ids)
-                log("restock alert FAILED to send — state not advanced; will retry next cycle")
+                log("restock alert FAILED on BOTH channels — state not advanced; retry next cycle")
         else:
             log("confirmation failed/disagreed — treating as a blip, NO alert")
 
